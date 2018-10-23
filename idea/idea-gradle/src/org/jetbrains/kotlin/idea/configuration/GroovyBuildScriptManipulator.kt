@@ -28,6 +28,7 @@ import org.jetbrains.kotlin.idea.configuration.KotlinWithGradleConfigurator.Comp
 import org.jetbrains.kotlin.idea.util.application.runReadAction
 import org.jetbrains.kotlin.idea.util.module
 import org.jetbrains.kotlin.psi.psiUtil.getChildrenOfType
+import org.jetbrains.kotlin.psi.psiUtil.getStrictParentOfType
 import org.jetbrains.plugins.groovy.lang.psi.GroovyFile
 import org.jetbrains.plugins.groovy.lang.psi.GroovyPsiElementFactory
 import org.jetbrains.plugins.groovy.lang.psi.api.statements.GrStatement
@@ -246,6 +247,23 @@ class GroovyBuildScriptManipulator(
             )
     }
 
+    private fun usesNewMultiplatform(): Boolean {
+        val fileText = runReadAction { scriptFile.text }
+        return fileText.contains("kotlin-multiplatform")
+    }
+
+    private fun GrClosableBlock.addParameterAssignment(
+        parameterName: String,
+        defaultValue: String,
+        replaceIt: GrStatement.(Boolean) -> GrStatement
+    ) {
+        statements.firstOrNull { stmt ->
+            (stmt as? GrAssignmentExpression)?.lValue?.text == parameterName
+        }?.let { stmt ->
+            stmt.replaceIt(false)
+        } ?: addLastExpressionInBlockIfNeeded("$parameterName = $defaultValue")
+    }
+
     private fun addOrReplaceKotlinTaskParameter(
         gradleFile: GroovyFile,
         parameterName: String,
@@ -253,6 +271,30 @@ class GroovyBuildScriptManipulator(
         forTests: Boolean,
         replaceIt: GrStatement.(Boolean) -> GrStatement
     ): PsiElement? {
+        if (usesNewMultiplatform()) {
+            val kotlinTargets = gradleFile.getHierarchicalBlock("kotlin.targets") ?: return null
+            val targetNames = mutableListOf<String>()
+            for (target in kotlinTargets.statements) {
+                if (target is GrMethodCallExpression && target.invokedExpression.text == "fromPreset") {
+                    val targetNameArgument = target.argumentList.expressionArguments.getOrNull(1)?.text
+                    if (targetNameArgument != null) {
+                        targetNames += targetNameArgument.filter { it != '\'' && it != '"' }
+                    }
+                }
+            }
+
+            val configureBlock = kotlinTargets.getBlockOrCreate("configure")
+            val factory = GroovyPsiElementFactory.getInstance(kotlinTargets.project)
+            val argumentList = factory.createArgumentListFromText(
+                targetNames.joinToString(prefix = "([", postfix = "])", separator = ", ")
+            )
+            configureBlock.getStrictParentOfType<GrMethodCallExpression>()?.argumentList?.replaceWithArgumentList(argumentList)
+
+            val kotlinOptions = configureBlock.getBlockOrCreate("tasks.getByName(compilations.main.compileKotlinTaskName).kotlinOptions")
+            kotlinOptions.addParameterAssignment(parameterName, defaultValue, replaceIt)
+            return kotlinOptions.parent.parent
+        }
+
         val kotlinBlock = gradleFile.getBlockOrCreate(if (forTests) "compileTestKotlin" else "compileKotlin")
 
         for (stmt in kotlinBlock.statements) {
@@ -261,13 +303,7 @@ class GroovyBuildScriptManipulator(
             }
         }
 
-        kotlinBlock.getBlockOrCreate("kotlinOptions").apply {
-            statements.firstOrNull { stmt ->
-                (stmt as? GrAssignmentExpression)?.lValue?.text == parameterName
-            }?.let { stmt ->
-                stmt.replaceIt(false)
-            } ?: addLastExpressionInBlockIfNeeded("$parameterName = $defaultValue")
-        }
+        kotlinBlock.getBlockOrCreate("kotlinOptions").addParameterAssignment(parameterName, defaultValue, replaceIt)
 
         return kotlinBlock.parent
     }
@@ -377,6 +413,21 @@ class GroovyBuildScriptManipulator(
                 block = getBlockByName(name)!!
             }
             return block
+        }
+
+        fun GrStatementOwner.getHierarchicalBlock(name: String): GrClosableBlock? {
+            val block = getBlockByName(name)
+            if (block != null) return block
+            val dotIndex = name.lastIndexOf(".")
+            if (dotIndex != -1) {
+                val parentName = name.substring(0, dotIndex)
+                val childName = name.substring(dotIndex + 1)
+                val parent = getHierarchicalBlock(parentName)
+                if (parent != null) {
+                    return parent.getHierarchicalBlock(childName)
+                }
+            }
+            return null
         }
 
         fun GrStatementOwner.getBlockOrPrepend(name: String) = getBlockOrCreate(name) { newBlock ->
